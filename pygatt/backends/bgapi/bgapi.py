@@ -67,12 +67,11 @@ class AdvertisingAndScanInfo(object):
     address.
     """
     def __init__(self):
-        self.name = ""
-        self.address = ""
+        self.name = ''
+        self.address = ''
         self.rssi = None
-        self.packet_data = {
-            # scan_response_packet_type[xxx]: data_dictionary,
-        }
+        self.packet_data = dict()
+        self.msd = ''
 
 
 class BGAPIBackend(BLEBackend):
@@ -244,7 +243,8 @@ class BGAPIBackend(BLEBackend):
         self.expect(ResponsePacketType.system_address_get)
 
     def stop(self):
-        for device in self._connections.values():
+#         d = self._connections
+        for device in list(self._connections.values()):
             try:
                 device.disconnect()
             except NotConnectedError:
@@ -378,7 +378,26 @@ class BGAPIBackend(BLEBackend):
         log.info("Discovered %d devices: %s", len(devices), devices)
         self._devices_discovered = {}
         return devices
-
+    
+    def start_continuous_scan(self, scan_interval=75, scan_window=50, active=True,
+             discover_mode=constants.gap_discover_mode['observation'],
+             scan_cb=None, **kwargs):
+        log.info("Starting continuous scan")
+        parameters = 1 if active else 0
+        self.send_command(
+            CommandBuilder.gap_set_scan_parameters(
+                scan_interval, scan_window, parameters
+            ))
+        self.expect(ResponsePacketType.gap_set_scan_parameters)
+        log.info("Starting an %s scan", "active" if active else "passive")
+        self.send_command(CommandBuilder.gap_discover(discover_mode))
+        self.expect(ResponsePacketType.gap_discover)
+        
+    def stop_continuous_scan(self):
+        log.info("Stopping continuous scan")
+        self.send_command(CommandBuilder.gap_end_procedure())
+        self.expect(ResponsePacketType.gap_end_procedure)
+        
     def _end_procedure(self):
         self.send_command(CommandBuilder.gap_end_procedure())
         self.expect(ResponsePacketType.gap_end_procedure)
@@ -632,11 +651,54 @@ class BGAPIBackend(BLEBackend):
                       packet_type, get_return_message(return_code))
 
             if packet_type in self._packet_handlers:
+#                 print(self._packet_handlers[packet_type])
                 self._packet_handlers[packet_type](response)
 
             if packet_type in expected_packet_choices:
                 return packet_type, response
 
+
+    def get_devices_discovered(self):
+        '''
+        Should be called at regular intervals to process advertising packets from the queue
+        '''
+        devices_discovered = dict()
+        while True:
+            try:
+                packet = self._receiver_queue.get(block=False)
+                packet_type, response = self._lib.decode_packet(packet)
+                packet_type = constants.scan_response_packet_type[response['packet_type']]
+                address = bgapi_address_to_hex(response['sender'])
+                name, data_dict = self._scan_rsp_data(response['data'])
+                
+                if address not in devices_discovered:
+                    devices_discovered[address] = AdvertisingAndScanInfo()
+                
+                dev = devices_discovered[address]
+                if (packet_type not in dev.packet_data or
+                        len(dev.packet_data[packet_type]) < len(data_dict)):
+                    dev.packet_data[packet_type] = data_dict
+                    
+                dev.rssi = response['rssi']
+                if dev.name == '':
+                    dev.name = name
+                if dev.address == '':
+                    dev.address = address
+                if dev.msd == '':
+                    dev.msd = data_dict['manufacturer_specific_data']
+            except queue.Empty:
+                log.debug('Empty advertising data queue')
+                break
+            except bglib.UnknownMessageType:
+                log.warn("Ignoring message decode failure")
+            except KeyError:
+                log.debug('No manufacturing specific data')
+            except Exception as ex:
+                template = "An exception of type {0} occurred.  Arguments:\n{1!r}"
+                message = template.format(type(ex).__name__, ex.args)
+                print(message)
+        return devices_discovered
+    
     def _receive(self):
         """
         Read bytes from serial and enqueue the packets if the packet is not a.
@@ -777,7 +839,7 @@ class BGAPIBackend(BLEBackend):
                 len(dev.packet_data[packet_type]) < len(data_dict)):
             dev.packet_data[packet_type] = data_dict
         dev.rssi = args['rssi']
-        log.debug("Received a scan response from %s with rssi=%d dBM "
+        log.debug("\nReceived a scan response from %s with rssi=%d dBM "
                   "and data=%s", address, args['rssi'], data_dict)
 
         if self._scan_cb is not None:
